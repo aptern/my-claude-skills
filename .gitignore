@@ -1,0 +1,19 @@
+# --- Секреты (заполняются локально, в репозиторий не попадают) ---
+**/config/.env
+**/.env
+**/config/config.json
+**/config/service_account_key.json
+
+# --- Кэши и регенерируемые данные ---
+**/cache/
+!**/cache/.gitkeep
+
+# --- Python ---
+**/.venv/
+**/__pycache__/
+*.pyc
+
+# --- OS / прочее ---
+.DS_Store
+*.bak
+*.log

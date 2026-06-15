@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin shell wrapper so the skill can be invoked without remembering paths.
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/scripts/scrape.py" "$@"

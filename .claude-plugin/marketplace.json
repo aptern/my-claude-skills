@@ -1,0 +1,21 @@
+{
+  "name": "nacifrah-skills",
+  "owner": {
+    "name": "Artem Pozdnyakov"
+  },
+  "metadata": {
+    "description": "Личные скиллы Claude Code: Yandex Webmaster API, Yandex Wordstat API и ScrapeGraph-AI веб-скрапер.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "nacifrah-skills",
+      "source": "./",
+      "description": "Yandex Webmaster (SEO-данные), Yandex Wordstat (спрос/семантика) и ScrapeGraph-AI (LLM веб-скрапер).",
+      "version": "1.0.0",
+      "category": "productivity",
+      "skills": "./skills/",
+      "tags": ["seo", "yandex", "wordstat", "webmaster", "scraping"]
+    }
+  ]
+}

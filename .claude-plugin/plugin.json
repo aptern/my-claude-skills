@@ -1,0 +1,9 @@
+{
+  "name": "nacifrah-skills",
+  "description": "Личные скиллы: Yandex Webmaster API, Yandex Wordstat API, ScrapeGraph-AI веб-скрапер.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Artem Pozdnyakov"
+  },
+  "skills": "./skills/"
+}
