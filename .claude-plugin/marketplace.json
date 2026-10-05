@@ -4,17 +4,22 @@
     "name": "Artem Pozdnyakov"
   },
   "metadata": {
-    "description": "Личные скиллы Claude Code: Yandex Webmaster API, Yandex Wordstat API и ScrapeGraph-AI веб-скрапер.",
-    "version": "1.0.0"
+    "description": "Скиллы Claude Code агентства «НА ЦИФРАХ»: Wordstat (отдельный плагин), Яндекс Вебмастер, ScrapeGraph-AI.",
+    "version": "1.1.0"
   },
   "plugins": [
     {
+      "name": "yandex-wordstat",
+      "source": "./plugins/yandex-wordstat",
+      "description": "Спрос и семантика через Wordstat API (Yandex Cloud): топ запросов, динамика, регионы, CSV, упущенный спрос по выгрузке Директа.",
+      "category": "productivity",
+      "tags": ["wordstat", "yandex", "seo", "semantics"]
+    },
+    {
       "name": "nacifrah-skills",
       "source": "./",
-      "description": "Yandex Webmaster (SEO-данные), Yandex Wordstat (спрос/семантика) и ScrapeGraph-AI (LLM веб-скрапер).",
-      "version": "1.0.0",
+      "description": "Личный набор автора: Yandex Webmaster (SEO-данные nacifrah.ru), Yandex Wordstat и ScrapeGraph-AI. Для одного Wordstat ставьте плагин yandex-wordstat.",
       "category": "productivity",
-      "skills": "./skills/",
       "tags": ["seo", "yandex", "wordstat", "webmaster", "scraping"]
     }
   ]

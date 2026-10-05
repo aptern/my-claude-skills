@@ -1,0 +1,12 @@
+{
+  "name": "yandex-wordstat",
+  "version": "1.1.0",
+  "description": "Спрос и семантика через Wordstat API (Yandex Cloud): топ запросов и ассоциации, динамика, регионы, экспорт CSV, поиск упущенного спроса по выгрузке Директа.",
+  "author": {
+    "name": "Aleksandr Poliakov, Artem Pozdnyakov"
+  },
+  "homepage": "https://github.com/aptern/my-claude-skills/tree/main/plugins/yandex-wordstat",
+  "repository": "https://github.com/aptern/my-claude-skills",
+  "license": "MIT",
+  "keywords": ["wordstat", "yandex", "семантика", "спрос", "директ"]
+}

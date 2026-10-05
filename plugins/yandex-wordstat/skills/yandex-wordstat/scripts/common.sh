@@ -27,13 +27,36 @@ fi
 if [ -z "${WORDSTAT_SKILL_DIR:-}" ]; then
     WORDSTAT_SKILL_DIR="$(cd "$WORDSTAT_SCRIPT_DIR/.." && pwd)"
 fi
-WORDSTAT_CONFIG_DIR="${WORDSTAT_CONFIG_DIR:-$WORDSTAT_SKILL_DIR/config}"
+
+# Config directory. Order:
+#   1. WORDSTAT_CONFIG_DIR            — preset by tests (internal override)
+#   2. YANDEX_WORDSTAT_CONFIG_DIR     — user override
+#   3. <skill>/config/                — if it already holds config.json or .env
+#                                       (manual install, existing setups)
+#   4. ~/.config/yandex-wordstat/     — if the directory exists. Survives plugin
+#                                       updates: a plugin installed via /plugin
+#                                       lives in a versioned cache directory that
+#                                       is replaced on every update.
+#   5. <skill>/config/                — default (error messages point here)
+if [ -z "${WORDSTAT_CONFIG_DIR:-}" ]; then
+    _ws_user_cfg="${YANDEX_WORDSTAT_CONFIG_DIR:-}"
+    if [ -n "$_ws_user_cfg" ]; then
+        WORDSTAT_CONFIG_DIR="$_ws_user_cfg"
+    elif [ -f "$WORDSTAT_SKILL_DIR/config/config.json" ] || [ -f "$WORDSTAT_SKILL_DIR/config/.env" ]; then
+        WORDSTAT_CONFIG_DIR="$WORDSTAT_SKILL_DIR/config"
+    elif [ -n "${HOME:-}${XDG_CONFIG_HOME:-}" ] && [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/yandex-wordstat" ]; then
+        WORDSTAT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/yandex-wordstat"
+    else
+        WORDSTAT_CONFIG_DIR="$WORDSTAT_SKILL_DIR/config"
+    fi
+    unset _ws_user_cfg
+fi
 WORDSTAT_CACHE_DIR="${WORDSTAT_CACHE_DIR:-$WORDSTAT_SKILL_DIR/cache}"
 
 WORDSTAT_LEGACY_API="https://api.wordstat.yandex.net/v1"
 WORDSTAT_CLOUD_API="https://searchapi.api.cloud.yandex.net/v2/wordstat"
 WORDSTAT_IAM_API="https://iam.api.cloud.yandex.net/iam/v1/tokens"
-WORDSTAT_README_URL="https://github.com/artwist-polyakov/polyakov-claude-skills/blob/main/plugins/yandex-wordstat/skills/yandex-wordstat/config/README.md"
+WORDSTAT_README_URL="https://github.com/aptern/my-claude-skills/blob/main/plugins/yandex-wordstat/README.md"
 
 # Exported by load_config so callers and die_with_help can read them
 WORDSTAT_BACKEND=""
@@ -62,8 +85,10 @@ die_with_help() {
         printf '\n'
         printf 'Likely the plugin config needs updating. See:\n'
         printf '  %s\n\n' "$WORDSTAT_README_URL"
+        printf 'Config dir in use: %s\n' "$WORDSTAT_CONFIG_DIR"
+        printf '  (override: YANDEX_WORDSTAT_CONFIG_DIR; persistent default: ~/.config/yandex-wordstat/)\n\n'
         printf 'Quick checks:\n'
-        printf '  - cloud mode:  config/config.json has yandex_cloud_folder_id?\n'
+        printf '  - cloud mode:  config.json has yandex_cloud_folder_id and auth.api_key (or auth.service_account_key_file)?\n'
         if [ -n "$WORDSTAT_CLOUD_SA_KEY_PATH" ]; then
             printf '                 SA key file: %s\n' "$WORDSTAT_CLOUD_SA_KEY_PATH"
             printf '                 (resolved from auth.service_account_key_file) — present and readable?\n'
@@ -138,12 +163,21 @@ print("" if v is None else v)
 PYEOF
 }
 
-# Resolve a path: absolute as-is, relative resolved against skill dir
+# Resolve a path: absolute as-is; "~/" expanded; relative resolved against the
+# skill dir (historical behaviour), falling back to the config dir — so a key
+# file can sit next to config.json in ~/.config/yandex-wordstat/.
 _resolve_path() {
     _rp="$1"
     case "$_rp" in
         /*) printf '%s\n' "$_rp" ;;
-        *)  printf '%s/%s\n' "$WORDSTAT_SKILL_DIR" "$_rp" ;;
+        "~/"*) printf '%s/%s\n' "${HOME:-}" "${_rp#\~/}" ;;
+        *)
+            if [ ! -e "$WORDSTAT_SKILL_DIR/$_rp" ] && [ -e "$WORDSTAT_CONFIG_DIR/$_rp" ]; then
+                printf '%s/%s\n' "$WORDSTAT_CONFIG_DIR" "$_rp"
+            else
+                printf '%s/%s\n' "$WORDSTAT_SKILL_DIR" "$_rp"
+            fi
+            ;;
     esac
 }
 
@@ -207,7 +241,7 @@ load_config() {
                 fi
                 if [ "$_rc" = "1" ]; then
                     WORDSTAT_BACKEND="cloud"
-                    die_with_help "YANDEX_WORDSTAT_BACKEND=cloud but config/config.json is missing"
+                    die_with_help "YANDEX_WORDSTAT_BACKEND=cloud but $WORDSTAT_CONFIG_DIR/config.json is missing"
                 fi
                 WORDSTAT_BACKEND="cloud"
                 WORDSTAT_BACKEND_DETECTED_VIA="explicit override"
@@ -240,7 +274,7 @@ load_config() {
     if [ "$_rc" = "2" ]; then
         # Malformed cloud config → fail loudly, do NOT silently fall back
         WORDSTAT_BACKEND="cloud"
-        die_with_help "config/config.json present but invalid: $WORDSTAT_BACKEND_DETECTED_VIA"
+        die_with_help "$WORDSTAT_CONFIG_DIR/config.json present but invalid: $WORDSTAT_BACKEND_DETECTED_VIA"
     fi
 
     # 3. Legacy creds present → legacy
@@ -276,9 +310,12 @@ print_backend_info() {
             ;;
         cloud)
             echo "Backend: cloud ($WORDSTAT_BACKEND_DETECTED_VIA)"
+            echo "  config:    $WORDSTAT_CONFIG_DIR"
             echo "  folder_id: $WORDSTAT_CLOUD_FOLDER_ID"
             if [ -n "${WORDSTAT_CLOUD_API_KEY:-}" ]; then
-                echo "  auth:      Api-Key (last 4: ...${WORDSTAT_CLOUD_API_KEY##*????})"
+                _k="$WORDSTAT_CLOUD_API_KEY"
+                echo "  auth:      Api-Key (last 4: ...${_k#"${_k%????}"})"
+                unset _k
             else
                 echo "  SA key:    $WORDSTAT_CLOUD_SA_KEY_PATH"
             fi
@@ -289,8 +326,9 @@ print_backend_info() {
             echo "  POST $WORDSTAT_CLOUD_API/regions"
             echo ""
             echo "=== API Limits ==="
-            echo "  Wordstat in Search API is currently in Preview."
-            echo "  See https://yandex.cloud/ru/docs/search-api/pricing for current limits and billing."
+            echo "  Quotas are per cloud (requests/second and requests/hour, no daily limit)."
+            echo "  Current values: https://aistudio.yandex.ru/docs/ru/search-api/concepts/limits"
+            echo "  Pricing:        https://aistudio.yandex.ru/docs/ru/search-api/pricing"
             ;;
         *)
             echo "Backend: (not configured)"
@@ -776,6 +814,9 @@ _cloud_request() {
                 fi
                 _err=$(cat "$_resp_file" 2>/dev/null)
                 rm -rf "$_tmp"
+                if [ "$_auth_mode" = "apikey" ]; then
+                    die_with_help "Cloud Wordstat 401 Unauthorized (API key rejected: check the key and its scope yc.search-api.execute)" "$_err"
+                fi
                 die_with_help "Cloud Wordstat 401 Unauthorized after token refresh" "$_err"
                 ;;
             403)

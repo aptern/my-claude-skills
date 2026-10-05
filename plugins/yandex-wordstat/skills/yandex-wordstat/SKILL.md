@@ -18,14 +18,22 @@ Analyze search demand and keyword statistics using Yandex Wordstat API.
 
 Скилл поддерживает два бэкенда:
 
-- **`cloud`** (рекомендуется) — Yandex Cloud Search API v2. Нужен `config/config.json` + service account key. Авторизация через IAM token (JWT с SA-ключа).
-- **`legacy`** (deprecated) — старый Wordstat OAuth API. Нужен `YANDEX_WORDSTAT_TOKEN` в `config/.env`. Яндекс больше не подключает новых пользователей, но старые токены работают.
+- **`cloud`** (рекомендуется) — Wordstat в Yandex Cloud Search API v2. Нужен `config.json` с `yandex_cloud_folder_id` и одним из способов входа: `auth.api_key` (API-ключ сервисного аккаунта) или `auth.service_account_key_file` (авторизованный JSON-ключ, IAM-токен скрипты получают сами).
+- **`legacy`** (deprecated) — старый Wordstat OAuth API. Нужен `YANDEX_WORDSTAT_TOKEN` в `.env`. Новым пользователям Яндекс его не выдаёт.
 
-**Auto-selection (cloud-first)**: cloud выигрывает на tie. Чтобы остаться на legacy явно — `YANDEX_WORDSTAT_BACKEND=legacy` в `config/.env`.
+**Где лежат настройки** (первое подходящее):
+1. `$YANDEX_WORDSTAT_CONFIG_DIR`, если переменная задана;
+2. `config/` внутри скилла, если там уже есть `config.json` или `.env`;
+3. `~/.config/yandex-wordstat/` — постоянное место, переживает обновления плагина;
+4. иначе — `config/` внутри скилла.
+
+`bash scripts/quota.sh` печатает, какая папка используется (`config:`).
+
+**Auto-selection (cloud-first)**: cloud выигрывает на tie. Чтобы остаться на legacy явно — `YANDEX_WORDSTAT_BACKEND=legacy` в `.env`.
 
 Полная инструкция по настройке и troubleshooting: [config/README.md](config/README.md).
 
-**Миграция в облако**: когда Яндекс окончательно отключит legacy — удалите `YANDEX_WORDSTAT_TOKEN`, заполните `config/config.json` и `config/service_account_key.json`. Команды и аргументы скриптов не меняются.
+**Миграция в облако**: удалите `YANDEX_WORDSTAT_TOKEN`, заполните `config.json` (API-ключ или JSON-ключ сервисного аккаунта). Команды и аргументы скриптов не меняются.
 
 ⚠️ **Cloud `dynamics` operator caveat**: при `--period weekly|monthly` cloud-бэкенд поддерживает только оператор `+`. Минус-слова, кавычки, группировки и точные формы работают только при `--period daily`. Скилл делает preflight-проверку и падает с понятной ошибкой до запроса. Подробнее — в README.
 
@@ -309,7 +317,8 @@ Run `bash scripts/regions_tree.sh` for full list.
 ## Limits
 
 - **10 requests/second**
-- **1000 requests/day**
+- **Почасовая квота облака, дневного лимита нет.** По документации Yandex Search API на 05.10.2026 квота по умолчанию — 100 запросов/час на получение статистики (10.07.2026 там было указано 2 000/час — значение менялось, проверяй актуальное). Квоту можно поднять через поддержку Yandex Cloud: https://aistudio.yandex.ru/docs/ru/search-api/concepts/limits
+- **Запросы платные** (кроме списка регионов): https://aistudio.yandex.ru/docs/ru/search-api/pricing. Один вызов скрипта = один запрос (даже `--limit 2000`). Перед длинными сериями (десятки фраз, все группы в «упущенном спросе») прикинь число запросов и предупреди пользователя.
 
 ## Example Session
 

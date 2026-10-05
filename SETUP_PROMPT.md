@@ -17,17 +17,22 @@
 
 ```
 /plugin marketplace add aptern/my-claude-skills
-/plugin install nacifrah-skills
+/plugin install nacifrah-skills@nacifrah-skills
 ```
 
-После установки настрой каждый скилл (плагин лежит в
-`~/.claude/plugins/cache/.../nacifrah-skills/skills/<skill>/`):
+Плагин `yandex-wordstat` отдельно НЕ ставь — Wordstat уже входит в `nacifrah-skills`.
 
-1. **yandex-webmaster** — создай `config/.env` из `config/.env.example` и впиши
-   `YANDEX_WEBMASTER_TOKEN` и `YANDEX_WEBMASTER_HOST` из раздела КЛЮЧИ.
-2. **yandex-wordstat** — создай `config/config.json` из `config/config.example.json`
-   и впиши `yandex_cloud_folder_id` и `auth.api_key` из раздела КЛЮЧИ.
-3. **scrapegraph-ai** — создай `config/.env` из `config/env.example` и впиши
+После установки настрой каждый скилл (плагин лежит в
+`~/.claude/plugins/cache/nacifrah-skills/nacifrah-skills/<версия>/`):
+
+1. **yandex-webmaster** — в `skills/yandex-webmaster/` создай `config/.env` из
+   `config/.env.example` и впиши `YANDEX_WEBMASTER_TOKEN` и `YANDEX_WEBMASTER_HOST`
+   из раздела КЛЮЧИ.
+2. **yandex-wordstat** — создай `~/.config/yandex-wordstat/config.json` по образцу
+   `plugins/yandex-wordstat/skills/yandex-wordstat/config/config.example.json`,
+   впиши `yandex_cloud_folder_id` и `auth.api_key` из раздела КЛЮЧИ, `chmod 600`.
+   Проверь: `bash <папка плагина>/plugins/yandex-wordstat/skills/yandex-wordstat/scripts/quota.sh`.
+3. **scrapegraph-ai** — в `skills/scrapegraph-ai/` создай `config/.env` из `config/env.example` и впиши
    `OPENAI_API_KEY` из раздела КЛЮЧИ. Затем подготовь Python-окружение:
    `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
    (если requirements.txt нет — посмотри зависимости в SKILL.md), и установи браузер:

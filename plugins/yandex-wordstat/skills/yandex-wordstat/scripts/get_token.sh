@@ -4,12 +4,12 @@
 # DEPRECATED — Yandex no longer onboards new users to the legacy Wordstat OAuth API.
 # This script only works for users who already have a Yandex OAuth client_id from
 # before the deprecation. For new setups, use the cloud backend instead — see
-# config/README.md → "Cloud mode (recommended)".
+# config/README.md → "Настройка через API-ключ".
 
 set -e
 
 echo "[NOTICE] Legacy mode only. Yandex stopped onboarding new Wordstat OAuth users."
-echo "[NOTICE] For cloud setup see config/README.md → 'Cloud mode'."
+echo "[NOTICE] For cloud setup see config/README.md → 'Настройка через API-ключ'."
 echo ""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
