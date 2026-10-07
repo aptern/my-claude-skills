@@ -30,8 +30,14 @@
    из раздела КЛЮЧИ.
 2. **yandex-wordstat** — создай `~/.config/yandex-wordstat/config.json` по образцу
    `plugins/yandex-wordstat/skills/yandex-wordstat/config/config.example.json`,
-   впиши `yandex_cloud_folder_id` и `auth.api_key` из раздела КЛЮЧИ, `chmod 600`.
-   Проверь: `bash <папка плагина>/plugins/yandex-wordstat/skills/yandex-wordstat/scripts/quota.sh`.
+   впиши `yandex_cloud_folder_id` и `auth.api_key` из раздела КЛЮЧИ и поставь
+   `"rate_limit_per_hour": 2000`, `chmod 600`. Квота: по умолчанию Яндекс даёт
+   100 запросов в час; квоту можно увеличить через поддержку Yandex Cloud — у автора
+   согласовано 2 000 в час. Без `rate_limit_per_hour` скилл ограничит себя сотней в час.
+   Проверь доступ: `bash <папка плагина>/plugins/yandex-wordstat/skills/yandex-wordstat/scripts/quota.sh`
+   (один настоящий запрос; должно быть `Wordstat API: OK`). Затем лимит — без запроса к API:
+   `bash <папка плагина>/plugins/yandex-wordstat/skills/yandex-wordstat/scripts/quota.sh --budget`;
+   в строке `Лимит:` должно быть `2000 в час (config.json: rate_limit_per_hour)`.
 3. **scrapegraph-ai** — в `skills/scrapegraph-ai/` создай `config/.env` из `config/env.example` и впиши
    `OPENAI_API_KEY` из раздела КЛЮЧИ. Затем подготовь Python-окружение:
    `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`

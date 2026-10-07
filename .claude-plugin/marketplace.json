@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Скиллы Claude Code агентства «НА ЦИФРАХ»: Wordstat (отдельный плагин), Яндекс Вебмастер, ScrapeGraph-AI.",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "plugins": [
     {

@@ -1,9 +1,13 @@
 #!/bin/sh
 # Test runner for wordstat skill — POSIX sh, no network.
+# Each test runs under $TEST_SHELL (default: sh). Run under both shells:
+#   sh tests/run.sh && TEST_SHELL=bash sh tests/run.sh
 
 set -e
 
 TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEST_SHELL="${TEST_SHELL:-sh}"
+echo "Shell: $TEST_SHELL"
 
 PASS=0
 FAIL=0
@@ -13,7 +17,7 @@ for t in "$TESTS_DIR"/test_*.sh; do
     [ -f "$t" ] || continue
     name=$(basename "$t" .sh)
     printf '%s ... ' "$name"
-    if sh "$t" >/dev/null 2>&1; then
+    if "$TEST_SHELL" "$t" >/dev/null 2>&1; then
         printf 'PASS\n'
         PASS=$((PASS + 1))
     else
@@ -22,7 +26,7 @@ for t in "$TESTS_DIR"/test_*.sh; do
         FAILED_TESTS="$FAILED_TESTS $name"
         # Re-run with output for diagnosis
         echo "--- output of $name ---"
-        sh "$t" 2>&1 || true
+        "$TEST_SHELL" "$t" 2>&1 || true
         echo "--- end ---"
     fi
 done

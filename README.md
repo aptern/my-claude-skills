@@ -22,6 +22,19 @@
 Дальше — доступ к API Яндекса, проверка и примеры запросов:
 **[plugins/yandex-wordstat/README.md](plugins/yandex-wordstat/README.md)**.
 
+### Квота Wordstat API
+
+По умолчанию Яндекс даёт 100 запросов в час; квоту можно увеличить через поддержку
+Yandex Cloud — у автора согласовано 2 000 в час. Скилл считает свои запросы и
+держится лимита 100 в час; увеличенную квоту впишите в `config.json`:
+
+```json
+"rate_limit_per_hour": 2000
+```
+
+Подробно — в [config/README.md](plugins/yandex-wordstat/skills/yandex-wordstat/config/README.md#квота-и-лимит-запросов).
+«До 2000 строк» в топе запросов — размер одного ответа, а не квота.
+
 ---
 
 ## Полный набор автора (`nacifrah-skills`)
@@ -48,6 +61,12 @@ Wordstat в наборе уже есть.
   (папка от версии не зависит). Формат и получение ключа — в
   [config/README.md](plugins/yandex-wordstat/skills/yandex-wordstat/config/README.md).
   Внутри плагина скилл лежит в `plugins/yandex-wordstat/skills/yandex-wordstat/`.
+  Если квоту увеличили (у автора согласовано 2 000 в час), впишите своё значение:
+  `"rate_limit_per_hour": 2000`. Без этой строки скилл ограничит себя квотой по
+  умолчанию, 100 запросов в час.
+  Если в версии 1.0.0 `config.json` лежал внутри папки плагина, скопируйте его в
+  `~/.config/yandex-wordstat/`: новая версия старую папку не видит. Старый файл не
+  удаляйте, пока его читают другие программы.
 - **yandex-webmaster** — `skills/yandex-webmaster/config/.env` из `config/.env.example`,
   впишите `YANDEX_WEBMASTER_TOKEN`. Получить токен: `bash scripts/get_token.sh` (внутри скилла).
 - **scrapegraph-ai** — `skills/scrapegraph-ai/config/.env` из `config/env.example`,

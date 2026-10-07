@@ -3,8 +3,11 @@
 #
 # Public API (sourced by other scripts):
 #   load_config            — picks backend, exports WORDSTAT_BACKEND, _DETECTED_VIA, _CLOUD_*
-#   wordstat_request M P   — request to Wordstat API, always returns LEGACY-shaped JSON
+#   wordstat_request M P   — request to Wordstat API, always returns LEGACY-shaped JSON.
+#                            Every HTTP attempt (retries included) first takes a slot
+#                            from the client-side rate limiter (see "Rate limiter").
 #   print_backend_info     — backend-aware diagnostic block (used by quota.sh)
+#   print_rate_budget      — hourly request budget from the local counter (no API call)
 #   die_with_help MSG      — structured error pointing user at config README
 #   json_escape, format_number, json_value, json_string  — legacy helpers (unchanged)
 #
@@ -131,11 +134,26 @@ json_string() {
 # ---------------------------------------------------------------------
 
 # Read .env if present (legacy creds + override). Sourced into current shell.
+# Rate-limiter settings already set in the process environment win over .env, so
+# a one-off `YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR=50 sh scripts/...` is honoured
+# even when .env holds 2000. Order: environment > .env > config.json > default.
 _load_env_file() {
     _env_file="$WORDSTAT_CONFIG_DIR/.env"
     if [ -f "$_env_file" ]; then
+        _le_h=${YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR:-__ws_unset__}
+        _le_s=${YANDEX_WORDSTAT_RATE_LIMIT_PER_SECOND:-__ws_unset__}
+        _le_w=${YANDEX_WORDSTAT_RATE_MAX_WAIT:-__ws_unset__}
+        _le_d=${YANDEX_WORDSTAT_STATE_DIR:-__ws_unset__}
         # shellcheck disable=SC1090
         . "$_env_file"
+        if [ "$_le_h" = __ws_unset__ ]; then
+            [ -z "${YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR:-}" ] || _ws_rl_hour_from_dotenv=1
+        else
+            YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR=$_le_h
+        fi
+        [ "$_le_s" = __ws_unset__ ] || YANDEX_WORDSTAT_RATE_LIMIT_PER_SECOND=$_le_s
+        [ "$_le_w" = __ws_unset__ ] || YANDEX_WORDSTAT_RATE_MAX_WAIT=$_le_w
+        [ "$_le_d" = __ws_unset__ ] || YANDEX_WORDSTAT_STATE_DIR=$_le_d
     fi
 }
 
@@ -305,6 +323,8 @@ print_backend_info() {
             echo "=== API Limits ==="
             echo "  - Rate limit: 10 requests/second"
             echo "  - Daily quota: 1000 requests"
+            echo "  - Local skill limit: rate_limit_per_hour (default 100/hour) applies here too;"
+            echo "    to change it set YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR in .env"
             echo ""
             echo "Note: This API is deprecated for new users. Existing tokens still work."
             ;;
@@ -326,14 +346,504 @@ print_backend_info() {
             echo "  POST $WORDSTAT_CLOUD_API/regions"
             echo ""
             echo "=== API Limits ==="
-            echo "  Quotas are per cloud (requests/second and requests/hour, no daily limit)."
-            echo "  Current values: https://aistudio.yandex.ru/docs/ru/search-api/concepts/limits"
-            echo "  Pricing:        https://aistudio.yandex.ru/docs/ru/search-api/pricing"
+            echo "  Квота считается на облако: по умолчанию Яндекс даёт 100 запросов в час"
+            echo "  и 10 в секунду, дневного лимита нет. Квоту можно увеличить через поддержку"
+            echo "  Yandex Cloud; тогда впишите её в config.json: \"rate_limit_per_hour\": <число>."
+            echo "  Limits:  https://aistudio.yandex.ru/docs/ru/search-api/concepts/limits"
+            echo "  Pricing: https://aistudio.yandex.ru/docs/ru/search-api/pricing"
             ;;
         *)
             echo "Backend: (not configured)"
             ;;
     esac
+}
+
+# ---------------------------------------------------------------------
+# Rate limiter — client-side hourly sliding window + per-second cap
+# ---------------------------------------------------------------------
+#
+# By default Yandex gives 100 Wordstat requests per hour and 10 per second per
+# cloud; the hourly quota can be raised through Yandex Cloud support. Instead of
+# running into HTTP 429, the skill counts its own calls in a small state file
+# (one epoch timestamp per line) and takes a slot before EVERY HTTP attempt to
+# the Wordstat API, retries included. IAM token requests are not counted.
+#
+# Settings. First match wins: process environment > the same variable in .env
+# next to config.json > config.json key > default (see _load_env_file).
+#   hourly limit   YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR   | config.json "rate_limit_per_hour"      | 100
+#                  0 = do not limit per hour (calls are still counted)
+#   per second     YANDEX_WORDSTAT_RATE_LIMIT_PER_SECOND | config.json "rate_limit_per_second"    | 10
+#   max wait, s    YANDEX_WORDSTAT_RATE_MAX_WAIT         | config.json "rate_limit_max_wait_sec"  | 60
+#   state dir      YANDEX_WORDSTAT_STATE_DIR | ${XDG_STATE_HOME:-~/.local/state}/yandex-wordstat
+#
+# Timestamps later than "now" (the clock was moved back) count as "now", so they
+# leave the window within an hour instead of blocking for longer.
+#
+# If the state dir cannot be written, a warning goes to stderr and requests go
+# out unlimited (the limiter never blocks work because of its own trouble).
+#
+# When the hourly budget is used up:
+#   - the next slot frees within "max wait" → a note on stderr, sleep, continue;
+#   - otherwise → an explanation in Russian on stderr, NO request is sent, and
+#     wordstat_request prints a legacy-shape error JSON on stdout:
+#       {"error":"local rate limit: ...","code":429,"retry_after":<s>}
+#     so every caller takes its usual '"error"' branch and exits 1.
+# HTTP 429 from Yandex is reported the same way (stderr text + error JSON).
+#
+# Concurrency: an exclusive flock(2) lock on calls.lock, taken by flock(1) when it
+# is installed (Linux) or by python3 otherwise (macOS; python3 is required by the
+# skill anyway). Only without both: an atomic symlink lock with age-based stale
+# detection. Lock trouble never blocks a request.
+#
+# Test hooks: WORDSTAT_STATE_DIR (state dir), WORDSTAT_RATE_NOW (fake clock,
+# epoch seconds), WORDSTAT_RATE_LOCK=flock|python|symlink (force a lock kind),
+# WORDSTAT_RATE_MAX_LOOPS (attempts before giving up, default 1000); _ws_sleep
+# may be redefined after sourcing.
+
+WORDSTAT_RATE_DEFAULT_PER_HOUR=100
+WORDSTAT_RATE_DEFAULT_PER_SECOND=10
+WORDSTAT_RATE_DEFAULT_MAX_WAIT=60
+WORDSTAT_RATE_WINDOW=3600
+
+_ws_now() {
+    if [ -n "${WORDSTAT_RATE_NOW:-}" ]; then
+        printf '%s\n' "$WORDSTAT_RATE_NOW"
+    else
+        date +%s
+    fi
+}
+
+_ws_sleep() {
+    sleep "$1"
+}
+
+_ws_state_dir() {
+    if [ -n "${WORDSTAT_STATE_DIR:-}" ]; then
+        printf '%s\n' "$WORDSTAT_STATE_DIR"
+    elif [ -n "${YANDEX_WORDSTAT_STATE_DIR:-}" ]; then
+        printf '%s\n' "$YANDEX_WORDSTAT_STATE_DIR"
+    elif [ -n "${XDG_STATE_HOME:-}" ]; then
+        printf '%s/yandex-wordstat\n' "$XDG_STATE_HOME"
+    elif [ -n "${HOME:-}" ]; then
+        printf '%s/.local/state/yandex-wordstat\n' "$HOME"
+    else
+        printf '%s/state\n' "$WORDSTAT_CACHE_DIR"
+    fi
+}
+
+_ws_is_uint() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# "<per_hour> <per_second> <max_wait>" from config.json, "-" for a missing key.
+_cfg_rate_values() {
+    _cfg_file="$WORDSTAT_CONFIG_DIR/config.json"
+    if [ ! -f "$_cfg_file" ]; then
+        echo "- - -"
+        return 0
+    fi
+    _CFG_FILE="$_cfg_file" python3 - <<'PYEOF' 2>/dev/null || echo "- - -"
+import json, os
+try:
+    with open(os.environ["_CFG_FILE"]) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+if not isinstance(cfg, dict):
+    cfg = {}
+out = []
+for key in ("rate_limit_per_hour", "rate_limit_per_second", "rate_limit_max_wait_sec"):
+    v = cfg.get(key)
+    if v is None:
+        out.append("-")
+    elif isinstance(v, bool):
+        out.append("invalid")
+    elif isinstance(v, (int, float)) and float(v).is_integer():
+        out.append(str(int(v)))
+    else:
+        s = "".join(str(v).split())  # "2 000" -> "2000"
+        out.append(s or "-")
+print(" ".join(out))
+PYEOF
+}
+
+# Resolve limiter settings into _rl_per_hour, _rl_per_second, _rl_max_wait and
+# _rl_hour_src (where the hourly limit came from). Dies on a malformed value.
+_ws_rate_settings() {
+    _rl_cfg=$(_cfg_rate_values)
+    read -r _rl_cfg_h _rl_cfg_s _rl_cfg_w <<EOF
+$_rl_cfg
+EOF
+    if [ -n "${YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR:-}" ]; then
+        _rl_per_hour="$YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR"
+        if [ "${_ws_rl_hour_from_dotenv:-}" = "1" ]; then
+            _rl_hour_src=".env: YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR"
+        else
+            _rl_hour_src="переменная окружения YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR"
+        fi
+    elif [ "${_rl_cfg_h:--}" != "-" ]; then
+        _rl_per_hour="$_rl_cfg_h"
+        _rl_hour_src="config.json: rate_limit_per_hour"
+    else
+        _rl_per_hour="$WORDSTAT_RATE_DEFAULT_PER_HOUR"
+        _rl_hour_src="по умолчанию"
+    fi
+    if [ -n "${YANDEX_WORDSTAT_RATE_LIMIT_PER_SECOND:-}" ]; then
+        _rl_per_second="$YANDEX_WORDSTAT_RATE_LIMIT_PER_SECOND"
+    elif [ "${_rl_cfg_s:--}" != "-" ]; then
+        _rl_per_second="$_rl_cfg_s"
+    else
+        _rl_per_second="$WORDSTAT_RATE_DEFAULT_PER_SECOND"
+    fi
+    if [ -n "${YANDEX_WORDSTAT_RATE_MAX_WAIT:-}" ]; then
+        _rl_max_wait="$YANDEX_WORDSTAT_RATE_MAX_WAIT"
+    elif [ "${_rl_cfg_w:--}" != "-" ]; then
+        _rl_max_wait="$_rl_cfg_w"
+    else
+        _rl_max_wait="$WORDSTAT_RATE_DEFAULT_MAX_WAIT"
+    fi
+    if ! _ws_is_uint "$_rl_per_hour"; then
+        die_with_help "Неверный лимит запросов в час: '$_rl_per_hour' ($_rl_hour_src). Нужно целое число >= 0, например 100 или 2000."
+    fi
+    if ! _ws_is_uint "$_rl_per_second"; then
+        die_with_help "Неверный лимит запросов в секунду: '$_rl_per_second' (rate_limit_per_second / YANDEX_WORDSTAT_RATE_LIMIT_PER_SECOND). Нужно целое число >= 0."
+    fi
+    if ! _ws_is_uint "$_rl_max_wait"; then
+        die_with_help "Неверное время ожидания слота: '$_rl_max_wait' (rate_limit_max_wait_sec / YANDEX_WORDSTAT_RATE_MAX_WAIT). Нужно целое число секунд >= 0."
+    fi
+    return 0
+}
+
+# Run "$@" while holding the counter lock. Output of "$@" passes through.
+_ws_with_lock() {
+    _wl_dir=$(_ws_state_dir)
+    _wl_kind="${WORDSTAT_RATE_LOCK:-}"
+    if [ -z "$_wl_kind" ]; then
+        if command -v flock >/dev/null 2>&1; then
+            _wl_kind=flock
+        elif command -v python3 >/dev/null 2>&1; then
+            _wl_kind=python
+        else
+            _wl_kind=symlink
+        fi
+    fi
+    case "$_wl_kind" in
+        flock)
+            (
+                flock -w 10 9 2>/dev/null || :
+                "$@"
+            ) 9>>"$_wl_dir/calls.lock"
+            return $?
+            ;;
+        python)
+            # The same flock(2) lock that flock(1) takes. python3 locks the
+            # inherited fd 9 and exits; the lock belongs to the open file, so it
+            # stays held until this subshell closes fd 9. Gives up after 10 s,
+            # like `flock -w 10`.
+            (
+                python3 -c 'import fcntl, signal, sys
+signal.signal(signal.SIGALRM, lambda *a: sys.exit(1))
+signal.alarm(10)
+fcntl.flock(9, fcntl.LOCK_EX)' 2>/dev/null || :
+                "$@"
+            ) 9>>"$_wl_dir/calls.lock"
+            return $?
+            ;;
+    esac
+    # Last resort, only without both flock(1) and python3. `ln -s` is atomic and
+    # exclusive, and the link target carries "<pid>:<epoch>" written in the same
+    # step. A lock older than 10 s is stale (the critical section takes
+    # milliseconds) and is removed. Known gap: that removal is check-then-rm, not
+    # atomic. If the holder died and two or more processes wait, one of them can
+    # remove the lock another has just taken; both then enter the critical
+    # section and the hourly limit can be exceeded by one. A dead-PID check is
+    # NOT used: a holder exits right after releasing, so a waiter that read its
+    # PID would delete the next holder's fresh lock far more often.
+    _wl_lock="$_wl_dir/calls.lock.ln"
+    _wl_me="$$:$(_ws_now)"
+    _wl_i=0
+    while ! ln -s "$_wl_me" "$_wl_lock" 2>/dev/null; do
+        _wl_i=$((_wl_i + 1))
+        _wl_info=$(readlink "$_wl_lock" 2>/dev/null || :)
+        _wl_t=${_wl_info#*:}
+        if [ "$_wl_i" -lt 150 ] && [ -n "$_wl_info" ] && _ws_is_uint "$_wl_t"; then
+            _wl_age=$(($(_ws_now) - _wl_t))
+            [ "$_wl_age" -ge 0 ] || _wl_age=$((-_wl_age))
+            if [ "$_wl_age" -gt 10 ]; then
+                # take over only if the same stale holder still owns it
+                if [ "$(readlink "$_wl_lock" 2>/dev/null || :)" = "$_wl_info" ]; then
+                    rm -f "$_wl_lock"
+                fi
+                continue
+            fi
+        fi
+        if [ "$_wl_i" -ge 150 ]; then
+            # ~15 s without the lock: go on best-effort rather than block the request
+            _wl_rc=0
+            "$@" || _wl_rc=$?
+            return $_wl_rc
+        fi
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    _wl_rc=0
+    "$@" || _wl_rc=$?
+    if [ "$(readlink "$_wl_lock" 2>/dev/null || :)" = "$_wl_me" ]; then
+        rm -f "$_wl_lock"
+    fi
+    return $_wl_rc
+}
+
+# Critical section (call under _ws_with_lock): drop entries older than the
+# window, decide, and record the call when it may go ahead.
+# Args: per_hour per_second commit(1|0). per_hour/per_second 0 = no cap.
+# Prints: "OK <used>" | "HOUR <wait_s> <used>" | "SEC <used>"  (<used> = before this call)
+_ws_rate_try() {
+    _rt_hour="$1"; _rt_sec="$2"; _rt_commit="$3"
+    _rt_log="$(_ws_state_dir)/calls.log"
+    _rt_tmp="$_rt_log.$$.tmp"
+    _rt_now=$(_ws_now)
+    : > "$_rt_tmp" 2>/dev/null || return 1
+    _rt_stats="0 0"
+    if [ -f "$_rt_log" ]; then
+        # A timestamp later than now (clock moved back) is rewritten as now, so it
+        # leaves the window within an hour. Values are copied as strings: some
+        # awks print large numbers in exponent form.
+        _rt_stats=$(awk -v now="$_rt_now" -v win="$WORDSTAT_RATE_WINDOW" -v out="$_rt_tmp" '
+            $1 ~ /^[0-9]+$/ {
+                t = $1
+                if (t + 0 > now + 0) t = now
+                if (t + 0 > now - win) {
+                    printf "%s\n", t > out
+                    n++
+                    if (t + 0 >= now + 0) s++
+                }
+            }
+            END { printf "%d %d\n", n, s }' "$_rt_log" 2>/dev/null) || _rt_stats="0 0"
+    fi
+    _rt_n=${_rt_stats% *}
+    _rt_s=${_rt_stats#* }
+    if [ "$_rt_hour" -gt 0 ] && [ "$_rt_n" -ge "$_rt_hour" ]; then
+        # The slot frees when the (used - limit + 1)-th oldest call leaves the window
+        _rt_k=$((_rt_n - _rt_hour + 1))
+        _rt_t=$(sort -n "$_rt_tmp" | sed -n "${_rt_k}p")
+        [ -n "$_rt_t" ] || _rt_t="$_rt_now"
+        _rt_wait=$((_rt_t + WORDSTAT_RATE_WINDOW - _rt_now))
+        [ "$_rt_wait" -ge 1 ] || _rt_wait=1
+        _rt_res="HOUR $_rt_wait $_rt_n"
+    elif [ "$_rt_sec" -gt 0 ] && [ "$_rt_s" -ge "$_rt_sec" ]; then
+        _rt_res="SEC $_rt_n"
+    else
+        if [ "$_rt_commit" = "1" ]; then
+            printf '%s\n' "$_rt_now" >> "$_rt_tmp"
+        fi
+        _rt_res="OK $_rt_n"
+    fi
+    mv -f "$_rt_tmp" "$_rt_log" 2>/dev/null || rm -f "$_rt_tmp"
+    printf '%s\n' "$_rt_res"
+}
+
+# 1390 → "23 мин 10 с"
+_ws_fmt_duration() {
+    if [ "$1" -ge 60 ]; then
+        printf '%d мин %d с' $(($1 / 60)) $(($1 % 60))
+    else
+        printf '%d с' "$1"
+    fi
+}
+
+# epoch → local HH:MM (GNU date, then BSD/macOS date); empty if neither works
+_ws_clock_at() {
+    date -d "@$1" +%H:%M 2>/dev/null || date -r "$1" +%H:%M 2>/dev/null || :
+}
+
+_ws_rate_explain_exhausted() {
+    _ee_used="$1"; _ee_wait="$2"
+    _ee_at=$(_ws_clock_at $(($(_ws_now) + _ee_wait)))
+    {
+        printf '[wordstat] Исчерпан часовой лимит запросов к Wordstat: %s из %s за последние 60 минут.\n' "$_ee_used" "$_rl_per_hour"
+        printf '  Запрос НЕ отправлен. Следующий можно будет сделать через %s' "$(_ws_fmt_duration "$_ee_wait")"
+        if [ -n "$_ee_at" ]; then
+            printf ' (около %s)' "$_ee_at"
+        fi
+        printf '.\n'
+        printf '  Лимит скилла в час: %s (%s).\n' "$_rl_per_hour" "$_rl_hour_src"
+        if [ "${WORDSTAT_BACKEND:-}" = "legacy" ]; then
+            printf '  Старый Wordstat API (legacy): счётчик скилла действует и здесь, по умолчанию 100 запросов в час.\n'
+        else
+            printf '  По умолчанию Яндекс даёт 100 запросов в час; квоту можно увеличить через поддержку Yandex Cloud.\n'
+        fi
+        printf '  Что можно сделать:\n'
+        printf '    - подождать и повторить; остаток бюджета: sh scripts/quota.sh --budget (без запроса к API);\n'
+        printf '    - сократить план: меньше фраз, шире запросы, OR-группы (a|b|c) вместо отдельных вызовов;\n'
+        if [ "${WORDSTAT_BACKEND:-}" = "legacy" ]; then
+            printf '    - если ваша квота старого API больше, задайте её в .env: YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR=<число>.\n'
+            printf '      Папка настроек: %s\n' "$WORDSTAT_CONFIG_DIR"
+        else
+            printf '    - если квота в Yandex Cloud увеличена, впишите её в config.json: "rate_limit_per_hour": 2000\n'
+            printf '      (или переменную YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR). Папка настроек: %s\n' "$WORDSTAT_CONFIG_DIR"
+        fi
+        printf '    - чтобы скрипт сам дожидался слота, задайте YANDEX_WORDSTAT_RATE_MAX_WAIT=<секунд> (сейчас %s).\n' "$_rl_max_wait"
+        printf '  Счётчик запросов: %s/calls.log\n' "$(_ws_state_dir)"
+    } >&2
+}
+
+# The counter cannot be written: say so once per call, then let the request go.
+_ws_rate_warn_unenforced() {
+    {
+        printf '[wordstat] Нет записи в папку счётчика запросов %s — лимит %s в час не соблюдается.\n' \
+            "$1" "$_rl_per_hour"
+        printf '  Проверьте права на папку или задайте другую: YANDEX_WORDSTAT_STATE_DIR=<путь>.\n'
+    } >&2
+}
+
+# Take one request slot (waits if allowed). Returns 0 when the call may go ahead,
+# 1 when it must not (explanation already printed to stderr; _rl_last_reason,
+# _rl_last_used and _rl_last_wait hold the details for _ws_rate_error_json).
+_ws_rate_acquire() {
+    _ws_rate_settings
+    _rl_last_reason=""
+    _ra_dir=$(_ws_state_dir)
+    if ! (umask 077; mkdir -p "$_ra_dir") 2>/dev/null || [ ! -w "$_ra_dir" ]; then
+        _ws_rate_warn_unenforced "$_ra_dir"
+        return 0
+    fi
+    _ra_max_loops="${WORDSTAT_RATE_MAX_LOOPS:-1000}"
+    _ra_waited=0
+    _ra_loops=0
+    while [ "$_ra_loops" -lt "$_ra_max_loops" ]; do
+        _ra_loops=$((_ra_loops + 1))
+        if ! _ra_res=$(_ws_with_lock _ws_rate_try "$_rl_per_hour" "$_rl_per_second" 1 2>/dev/null); then
+            _ws_rate_warn_unenforced "$_ra_dir"
+            return 0
+        fi
+        read -r _ra_kind _ra_a _ra_b <<EOF
+$_ra_res
+EOF
+        case "$_ra_kind" in
+            SEC)
+                _ws_sleep 1
+                ;;
+            HOUR)
+                if [ $((_ra_waited + _ra_a)) -le "$_rl_max_wait" ]; then
+                    printf '[wordstat] Часовой лимит скилла (%s в час) исчерпан, свободный слот через %s — жду.\n' \
+                        "$_rl_per_hour" "$(_ws_fmt_duration "$_ra_a")" >&2
+                    _ws_sleep "$_ra_a"
+                    _ra_waited=$((_ra_waited + _ra_a))
+                else
+                    _rl_last_reason="hour"
+                    _rl_last_wait="$_ra_a"
+                    _rl_last_used="$_ra_b"
+                    _ws_rate_explain_exhausted "$_ra_b" "$_ra_a"
+                    return 1
+                fi
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+    # Still no slot after many attempts (e.g. the per-second check never clears):
+    # do not send the request unrecorded.
+    _rl_last_reason="stuck"
+    _rl_last_wait=1
+    {
+        printf '[wordstat] Счётчик запросов не выдал слот за %s попыток — запрос НЕ отправлен.\n' "$_ra_loops"
+        printf '  Проверьте системные часы и файл счётчика %s/calls.log, затем повторите.\n' "$_ra_dir"
+    } >&2
+    return 1
+}
+
+# Legacy-shape error JSON for a refused call (stdout).
+_ws_rate_error_json() {
+    if [ "${_rl_last_reason:-}" = "stuck" ]; then
+        printf '{"error":"local rate limit: no free slot in the local request counter, request not sent","code":429,"retry_after":1}\n'
+        return 0
+    fi
+    printf '{"error":"local rate limit: hourly quota of %s requests used up (%s in the last hour), retry in %s s","code":429,"retry_after":%s}\n' \
+        "$_rl_per_hour" "${_rl_last_used:-?}" "${_rl_last_wait:-0}" "${_rl_last_wait:-0}"
+}
+
+# First N characters (not bytes) of a string, so a UTF-8 character is never cut.
+# Args: N, string
+_ws_head_chars() {
+    printf '%s' "$2" | python3 -c 'import sys
+n = int(sys.argv[1])
+s = sys.stdin.buffer.read().decode("utf-8", "replace")[:n]
+sys.stdout.buffer.write(s.encode("utf-8"))' "$1" 2>/dev/null \
+        || printf '%s' "$2" | cut -c "1-$1"
+}
+
+# HTTP 429 from Yandex: explanation on stderr, legacy-shape error JSON on stdout.
+# Args: kind (hour|second|unknown), raw response body
+_ws_report_http_429() {
+    _h4_kind="$1"; _h4_raw="$2"
+    _h4_peek=$(_ws_with_lock _ws_rate_try 0 0 0 2>/dev/null) || _h4_peek="OK ?"
+    _h4_used=${_h4_peek#OK }
+    {
+        case "$_h4_kind" in
+            hour)   printf '[wordstat] Яндекс ответил 429: исчерпана почасовая квота Wordstat в облаке.\n' ;;
+            second) printf '[wordstat] Яндекс ответил 429: слишком часто (больше 10 запросов в секунду), повторы не помогли.\n' ;;
+            *)      printf '[wordstat] Яндекс ответил 429 (Too Many Requests): квота запросов исчерпана.\n' ;;
+        esac
+        printf '  По умолчанию Яндекс даёт 100 запросов в час и 10 в секунду; квоту можно увеличить через поддержку Yandex Cloud.\n'
+        printf '  Счётчик скилла за последний час: %s, лимит %s (%s).\n' "$_h4_used" "${_rl_per_hour:-?}" "${_rl_hour_src:-?}"
+        printf '  Если счётчик меньше квоты — тот же облачный каталог расходуют другие программы,\n'
+        printf '  или rate_limit_per_hour в config.json больше квоты, реально выданной в Yandex Cloud.\n'
+        printf '  Подождите (почасовое окно освобождается в течение часа) и повторите.\n'
+        printf '  Ответ Яндекса: %s\n' "$(_ws_head_chars 300 "$_h4_raw")"
+    } >&2
+    case "$_h4_kind" in
+        hour)   _h4_what="hourly quota exceeded" ;;
+        second) _h4_what="per-second limit exceeded" ;;
+        *)      _h4_what="quota exceeded" ;;
+    esac
+    printf '{"error":"HTTP 429 Too Many Requests: Wordstat %s","code":429}\n' "$_h4_what"
+}
+
+# Public: print the hourly budget from the local counter. Makes no API call.
+print_rate_budget() {
+    _ws_rate_settings
+    _pb_dir=$(_ws_state_dir)
+    (umask 077; mkdir -p "$_pb_dir") 2>/dev/null || :
+    _pb_ok=1
+    if [ ! -w "$_pb_dir" ] || ! _pb_peek=$(_ws_with_lock _ws_rate_try "$_rl_per_hour" 0 0 2>/dev/null); then
+        _pb_peek="OK 0"
+        _pb_ok=0
+    fi
+    read -r _pb_kind _pb_a _pb_b <<EOF
+$_pb_peek
+EOF
+    if [ "$_pb_kind" = "HOUR" ]; then
+        _pb_used="$_pb_b"
+    else
+        _pb_used="$_pb_a"
+    fi
+    echo "=== Бюджет запросов Wordstat (счётчик скилла, без запроса к API) ==="
+    if [ "$_rl_per_hour" -gt 0 ]; then
+        _pb_left=$((_rl_per_hour - _pb_used))
+        [ "$_pb_left" -ge 0 ] || _pb_left=0
+        echo "  Лимит:              $_rl_per_hour в час ($_rl_hour_src), $_rl_per_second в секунду"
+        echo "  За последние 60 мин: $_pb_used"
+        echo "  Осталось:           $_pb_left"
+        if [ "$_pb_kind" = "HOUR" ]; then
+            echo "  Следующий запрос:   через $(_ws_fmt_duration "$_pb_a")"
+        fi
+    else
+        echo "  Лимит:              в час не ограничен (rate_limit_per_hour = 0), $_rl_per_second в секунду"
+        echo "  За последние 60 мин: $_pb_used"
+    fi
+    echo "  Счётчик:            $_pb_dir/calls.log"
+    if [ "$_pb_ok" = "0" ]; then
+        echo "  Внимание: нет записи в папку счётчика — лимит не соблюдается, цифры выше неверны."
+        echo "  Проверьте права на папку или задайте другую: YANDEX_WORDSTAT_STATE_DIR=<путь>."
+    fi
+    echo ""
+    echo "  Учитываются только запросы скриптов этого скилла на этой машине."
+    echo "  По умолчанию Яндекс даёт 100 запросов в час; квоту можно увеличить через поддержку"
+    echo "  Yandex Cloud. Увеличенную квоту впишите в config.json: \"rate_limit_per_hour\": 2000"
 }
 
 # ---------------------------------------------------------------------
@@ -737,6 +1247,10 @@ PYEOF
 _legacy_request() {
     _method="$1"
     _params="$2"
+    if ! _ws_rate_acquire; then
+        _ws_rate_error_json
+        return 0
+    fi
     curl -s -X POST "$WORDSTAT_LEGACY_API/$_method" \
         -H "Authorization: Bearer $YANDEX_WORDSTAT_TOKEN" \
         -H "Content-Type: application/json; charset=utf-8" \
@@ -783,12 +1297,17 @@ _cloud_request() {
         _auth_mode="iam"
     fi
 
-    # 3. POST with retry on 5xx and refresh on 401
+    # 3. POST with retry on 5xx / per-second 429 and refresh on 401.
+    #    Every attempt (retries included) first takes a rate-limiter slot.
     _attempt=0
     _max_attempts=3
     _backoff=2
     while [ "$_attempt" -lt "$_max_attempts" ]; do
         _attempt=$((_attempt + 1))
+        if ! _ws_rate_acquire; then
+            _ws_rate_error_json
+            return 0
+        fi
         _tmp=$(_make_secure_tmpdir)
         _resp_file="$_tmp/resp"
         _status=$(curl -s -o "$_resp_file" -w '%{http_code}' \
@@ -825,10 +1344,29 @@ _cloud_request() {
                 die_with_help "Cloud Wordstat 403 Forbidden" \
                     "Check that your service account has the role 'search-api.webSearch.user' on folder $WORDSTAT_CLOUD_FOLDER_ID. Raw: $_err"
                 ;;
+            429)
+                _err=$(cat "$_resp_file" 2>/dev/null || :)
+                rm -rf "$_tmp"
+                # Hourly quota: retrying only burns attempts. Per-second throttling
+                # (or an unrecognised body, once) is worth a backoff and a retry.
+                case "$(printf '%s' "$_err" | LC_ALL=C tr '[:upper:]' '[:lower:]')" in
+                    *hour*)           _kind429="hour" ;;
+                    *second*|*rps*)   _kind429="second" ;;
+                    *)                _kind429="unknown" ;;
+                esac
+                if [ "$_attempt" -lt "$_max_attempts" ] && \
+                   { [ "$_kind429" = "second" ] || { [ "$_kind429" = "unknown" ] && [ "$_attempt" = "1" ]; }; }; then
+                    _ws_sleep "$_backoff"
+                    _backoff=$((_backoff * 2))
+                    continue
+                fi
+                _ws_report_http_429 "$_kind429" "$_err"
+                return 0
+                ;;
             5[0-9][0-9]|000)
                 if [ "$_attempt" -lt "$_max_attempts" ]; then
                     rm -rf "$_tmp"
-                    sleep "$_backoff"
+                    _ws_sleep "$_backoff"
                     _backoff=$((_backoff * 2))
                     continue
                 fi

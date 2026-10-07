@@ -44,7 +44,8 @@ if [ -z "$PHRASE" ]; then
     echo "  --phrase, -p   Search phrase (required)"
     echo "  --regions, -r  Region IDs, comma-separated (optional)"
     echo "  --devices, -d  Device filter: all, desktop, phone, tablet (default: all)"
-    echo "  --limit, -l    Number of results: 1-2000 (API default: 50)"
+    echo "  --limit, -l    Rows in the answer: 1-2000 (API default: 50)."
+    echo "                 Any value costs ONE API request — it is not the hourly quota."
     echo "  --csv, -c      Export to CSV file (UTF-8 with BOM, semicolon-separated)"
     echo "  --sep          CSV separator (default: ;)"
     echo ""
@@ -104,6 +105,13 @@ echo "Fetching data..."
 
 # Backend-aware request — common.sh writes legacy-shape JSON to stdout
 wordstat_request "topRequests" "$PARAMS" | tr -d '\n\r' > "$TMPFILE"
+
+# Empty answer: wordstat_request stopped with an error (details are on stderr above).
+# Without this check the pipeline above would hide it and print an empty table.
+if [ ! -s "$TMPFILE" ]; then
+    echo "Error: empty response from Wordstat (see the message above)"
+    exit 1
+fi
 
 # Check for error
 if grep -q '"error"' "$TMPFILE"; then

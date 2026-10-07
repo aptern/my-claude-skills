@@ -2,5 +2,6 @@
   "yandex_cloud_folder_id": "b1g...",
   "auth": {
     "api_key": "ваш_API-ключ"
-  }
+  },
+  "rate_limit_per_hour": 100
 }

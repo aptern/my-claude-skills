@@ -4,7 +4,8 @@ description: |
   Анализ поискового спроса через Yandex Wordstat API.
   Используй когда нужно: исследовать спрос, семантическое ядро,
   частотность запросов, сезонность или региональный спрос.
-  Топ до 2000 запросов, ассоциации, динамика, экспорт CSV.
+  Топ запросов (до 2000 строк в одном ответе), ассоциации, динамика, экспорт CSV.
+  Следит за часовой квотой API (по умолчанию 100 запросов в час).
   Поиск упущенного спроса: анализ XLSX-выгрузки из Яндекс Директ,
   сегментация фраз, расширение семантики, сравнение OR-запросов.
   Triggers: упущенный спрос.
@@ -28,6 +29,8 @@ Analyze search demand and keyword statistics using Yandex Wordstat API.
 4. иначе — `config/` внутри скилла.
 
 `bash scripts/quota.sh` печатает, какая папка используется (`config:`).
+
+**Квота**: по умолчанию Яндекс даёт 100 запросов в час; квоту можно увеличить через поддержку Yandex Cloud — у автора согласовано 2 000 в час. Скилл сам считает свои запросы и не даёт превысить лимит из `config.json` → `"rate_limit_per_hour"` (по умолчанию 100). Как планировать работу под этот бюджет — раздел [«Квота и бюджет запросов»](#квота-и-бюджет-запросов).
 
 **Auto-selection (cloud-first)**: cloud выигрывает на tie. Чтобы остаться на legacy явно — `YANDEX_WORDSTAT_BACKEND=legacy` в `.env`.
 
@@ -121,21 +124,27 @@ Look at search results:
 
 ### After getting answers:
 
-3. **Check connection**: `bash scripts/quota.sh`
-4. **Run analysis** using appropriate script
-5. **Verify intent via WebSearch** for each promising query
-6. **Present results** with target/non-target separation
+3. **Check the budget**: `bash scripts/quota.sh --budget` — бесплатно, без запроса к API.
+   Живую проверку `bash scripts/quota.sh` (она тратит 1 запрос) делай только при первой
+   настройке или после ошибки доступа.
+4. **Estimate the number of API requests** for the plan and compare with what is left
+   (see «Квота и бюджет запросов»). If the plan does not fit — tell the user BEFORE starting.
+5. **Run analysis** using appropriate script
+6. **Verify intent via WebSearch** for each promising query
+7. **Present results** with target/non-target separation
 
 ## Scripts
 
 ### quota.sh
-Check API connection.
+Hourly request budget and API connection check.
 ```bash
-bash scripts/quota.sh
+bash scripts/quota.sh --budget   # budget only: local counter, no API request, free
+bash scripts/quota.sh            # live check: ONE real request, then backend info and budget
 ```
 
 ### top_requests.sh
-Get top search phrases. Supports up to 2000 results and CSV export.
+Get top search phrases: up to 2000 result rows per call, CSV export.
+Any `--limit` (1 or 2000) costs exactly one API request — rows are not the quota.
 ```bash
 bash scripts/top_requests.sh \
   --phrase "юрист дтп" \
@@ -161,7 +170,7 @@ bash scripts/top_requests.sh \
 | `--phrase` | yes | - | text with operators |
 | `--regions` | no | all | comma-separated IDs |
 | `--devices` | no | all | all, desktop, phone, tablet |
-| `--limit` | no | API default (50) | 1-2000 (maps to API numPhrases) |
+| `--limit` | no | API default (50) | 1-2000 rows in the answer (API numPhrases; one request at any value) |
 | `--csv` | no | - | path to output CSV file |
 | `--sep` | no | ; | CSV separator (; for RU Excel) |
 
@@ -183,7 +192,7 @@ When `--csv` is set, stdout shows first 20 rows per section; full data goes to f
 
 When `--limit` is set to a high value (e.g. 500-2000), use CSV export and read the file in chunks:
 ```bash
-# Export 2000 results
+# Export 2000 rows (still one API request)
 bash scripts/top_requests.sh --phrase "query" --limit 2000 --csv data.csv
 
 # Read first 50 rows (header + data)
@@ -314,11 +323,59 @@ Multiple variants in one query.
 
 Run `bash scripts/regions_tree.sh` for full list.
 
-## Limits
+## Квота и бюджет запросов
 
-- **10 requests/second**
-- **Почасовая квота облака, дневного лимита нет.** По документации Yandex Search API на 05.10.2026 квота по умолчанию — 100 запросов/час на получение статистики (10.07.2026 там было указано 2 000/час — значение менялось, проверяй актуальное). Квоту можно поднять через поддержку Yandex Cloud: https://aistudio.yandex.ru/docs/ru/search-api/concepts/limits
-- **Запросы платные** (кроме списка регионов): https://aistudio.yandex.ru/docs/ru/search-api/pricing. Один вызов скрипта = один запрос (даже `--limit 2000`). Перед длинными сериями (десятки фраз, все группы в «упущенном спросе») прикинь число запросов и предупреди пользователя.
+По умолчанию Яндекс даёт 100 запросов в час; квоту можно увеличить через поддержку Yandex Cloud — у автора согласовано 2 000 в час. Кроме часовой квоты — не больше 10 запросов в секунду; дневного лимита нет. Квота считается на облако. Запросы платные (кроме списка регионов): https://aistudio.yandex.ru/docs/ru/search-api/pricing. Лимиты: https://aistudio.yandex.ru/docs/ru/search-api/concepts/limits
+
+«До 2000 строк» у `top_requests.sh --limit` — это размер одного ответа, а не квота: и `--limit 1`, и `--limit 2000` стоят один запрос.
+
+### Как скилл бережёт квоту
+
+Перед каждым запросом к API (и перед каждым повтором после 5xx / 429) скрипты берут слот у локального счётчика: скользящее окно 60 минут, файл `~/.local/state/yandex-wordstat/calls.log`.
+
+- Лимит — `"rate_limit_per_hour"` в `config.json` (по умолчанию **100**). При увеличенной квоте впиши её туда, например `"rate_limit_per_hour": 2000`. Порядок, если значение задано в нескольких местах: переменная окружения `YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR` → она же строкой в `.env` рядом с `config.json` → `config.json` → 100. Откуда взят лимит — строка `Лимит:` в `quota.sh --budget`.
+- Если до свободного слота не больше 60 секунд, скрипт ждёт сам (порог — `rate_limit_max_wait_sec` / `YANDEX_WORDSTAT_RATE_MAX_WAIT`).
+- Иначе запрос **не отправляется**: в stderr — «Исчерпан часовой лимит запросов к Wordstat: N из N…» с временем до следующего слота, в stdout — `{"error":"local rate limit: …","code":429,"retry_after":<сек>}`, код выхода 1.
+- Если Яндекс сам ответил 429 — скрипт пишет «Яндекс ответил 429…»: квоту облака расходует кто-то ещё (другие программы на том же каталоге) или лимит в `config.json` выше выданной квоты.
+
+Счётчик видит только запросы этого скилла на этой машине.
+
+### Сколько стоит каждый скрипт
+
+| Скрипт | Запросов к API |
+|---|---|
+| `top_requests.sh` | 1 за вызов при любом `--limit` |
+| `dynamics.sh` | 1 за вызов (несколько регионов через запятую — всё равно 1) |
+| `regions_stats.sh` | 1 |
+| `query_total.sh` | 1 |
+| `quota.sh` | 1; `quota.sh --budget` — 0 |
+| `regions_tree.sh`, `search_region.sh`, `missed_demand.py` | 0 |
+
+Повтор после ошибки сервера или 429 «слишком часто» — ещё один запрос.
+
+### Планирование под бюджет (обязательно)
+
+1. **Перед анализом из нескольких фраз посчитай запросы**: фразы × отдельные регионы × методы. Пример: 8 фраз, топ + месячная динамика по Москве = 16 запросов. «Упущенный спрос»: минимум 2 запроса на группу (X и Y), плюс 1 на проверку мусора (шаг 8.1), плюс 1, если пришлось повторить без минус-фраз кампании.
+2. **Узнай остаток**: `bash scripts/quota.sh --budget` → строка `Осталось:`.
+3. **Назови пользователю оценку до запуска**: «План — около 16 запросов, в этом часе осталось 40».
+4. **Если план больше остатка** — скажи об этом до первого запроса и предложи выбор: сократить и расставить приоритеты; укрупнить запросы; разбить работу по часам (скрипт показывает, когда освободится слот); если квота увеличена — вписать `rate_limit_per_hour` в `config.json`.
+5. **Меньше запросов, но шире**:
+   - один `top_requests.sh` по широкой фразе с `--limit 2000` даёт частотности до 2000 дочерних фраз — не запрашивай каждую из них отдельно;
+   - суммарный спрос по группе синонимов — один OR-запрос `(a|b|c)`, а не по запросу на вариант;
+   - «где ищут» — один `regions_stats.sh`, а не `top_requests.sh` по каждому городу;
+   - динамику бери для 3–5 ключевых фраз, а не для всего ядра;
+   - не повторяй уже сделанные запросы: сохраняй ответы (`--csv`, файлы) и переиспользуй их в сессии.
+6. **Параллельные субагенты делят один часовой бюджет** (счётчик общий). Раздели остаток между ними до запуска.
+7. **Получил «Исчерпан часовой лимит» или 429** — не повторяй в цикле. Остановись, покажи пользователю, что успели, сколько осталось и когда освободится слот.
+
+### Настройки лимита
+
+| Ключ в `config.json` | Переменная окружения | По умолчанию |
+|---|---|---|
+| `rate_limit_per_hour` | `YANDEX_WORDSTAT_RATE_LIMIT_PER_HOUR` | 100 (`0` — не ограничивать, только считать) |
+| `rate_limit_per_second` | `YANDEX_WORDSTAT_RATE_LIMIT_PER_SECOND` | 10 |
+| `rate_limit_max_wait_sec` | `YANDEX_WORDSTAT_RATE_MAX_WAIT` | 60 |
+| — | `YANDEX_WORDSTAT_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/yandex-wordstat` |
 
 ## Example Session
 

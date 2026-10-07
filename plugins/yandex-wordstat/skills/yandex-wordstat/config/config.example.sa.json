@@ -3,5 +3,6 @@
   "auth": {
     "service_account_key_file": "service_account_key.json",
     "openssl_bin": "openssl"
-  }
+  },
+  "rate_limit_per_hour": 100
 }
